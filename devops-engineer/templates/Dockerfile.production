@@ -1,0 +1,65 @@
+# syntax=docker/dockerfile:1.7
+# =============================================================================
+# ЭТАЛОННЫЙ ПРОИЗВОДСТВЕННЫЙ DOCKERFILE (MULTI-STAGE, ROOTLESS, ZERO-SECRETS)
+# Принципы:
+# 1. Фиксированные версии базовых образов (никакого :latest)
+# 2. BuildKit Secret Mount (--mount=type=secret) — токен не попадает в слои
+# 3. BuildKit Cache Mount (--mount=type=cache) — быстрая пересборка
+# 4. Статическая компиляция и минимальный финальный образ (distroless:nonroot)
+# 5. Обработка сигналов PID 1 (exec-форма ENTRYPOINT) и non-root UID 65532
+# =============================================================================
+
+ARG GO_VERSION=1.23
+FROM golang:${GO_VERSION}-alpine3.20 AS builder
+
+RUN apk add --no-cache git ca-certificates tzdata
+
+WORKDIR /src
+
+# 1. Сначала копируем только манифесты зависимостей для кэширования слоёв
+COPY go.mod go.sum ./
+
+# 2. Безопасное скачивание приватных модулей через BuildKit Secret Mount
+# Секрет монтируется в tmpfs (/run/secrets/github_token) только на время RUN
+# и гарантированно отсутствует в финальном образе и `docker history`
+ARG GOPRIVATE_SCOPE="github.com/your-org/*"
+ENV GOPRIVATE=${GOPRIVATE_SCOPE}
+
+RUN --mount=type=secret,id=github_token \
+    --mount=type=cache,target=/go/pkg/mod \
+    if [ -s /run/secrets/github_token ]; then \
+      git config --global url."https://x-access-token:$(cat /run/secrets/github_token)@github.com/".insteadOf "https://github.com/"; \
+    fi && \
+    go mod download && \
+    go mod verify && \
+    rm -f ~/.gitconfig
+
+# 3. Копируем исходный код и выполняем воспроизводимую сборку
+COPY . .
+
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+ARG VERSION=dev
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -trimpath \
+      -ldflags="-s -w -X main.version=${VERSION}" \
+      -o /out/app ./cmd/server
+
+# =============================================================================
+# RUNTIME STAGE (Distroless Static, Non-Root UID 65532, Read-Only Compatible)
+# Для динамических бинарников или Node/Python используй alpine:3.20 / slim
+# с установкой `dumb-init` (`ENTRYPOINT ["/usr/bin/dumb-init", "--"]`)
+# =============================================================================
+FROM gcr.io/distroless/static-debian12:nonroot AS runtime
+
+COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
+COPY --from=builder --chown=65532:65532 /out/app /app
+
+USER 65532:65532
+EXPOSE 8080
+
+# Строго exec-форма, чтобы процесс получал SIGTERM напрямую как PID 1
+ENTRYPOINT ["/app"]
